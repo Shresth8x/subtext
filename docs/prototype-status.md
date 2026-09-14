@@ -9,13 +9,15 @@
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env          # add ANTHROPIC_API_KEY for extract/diff
+cp .env.example .env          # add GEMINI_API_KEY (free) for extract/diff
 
 python -m subtext transcripts INFY    # list earnings-call transcripts on BSE
 python -m subtext parse INFY          # parse one, show speaker attribution   [no API key]
 python -m subtext extract INFY        # structured management claims          [needs key]
 python -m subtext diff INFY           # quarter-over-quarter diff             [needs key]
-python -m pytest tests/ -v            # 12 tests, no network needed
+python -m subtext batch --universe 100  # coverage across the index           [no API key]
+python -m subtext providers           # which LLM backend is configured
+python -m pytest tests/ -v            # 16 tests, no network needed
 ```
 
 The pipeline: **BSE announcement API → transcript PDF → speaker-attributed turns
@@ -23,23 +25,29 @@ The pipeline: **BSE announcement API → transcript PDF → speaker-attributed t
 
 ---
 
-## Verified against live data
+## Measured coverage — full Nifty 100, live data
 
-Ticker resolution, filing search, PDF download and parsing all run against BSE's
-public endpoints. Sweep across eight companies:
+`python -m subtext batch --universe 100`. Every stage up to the model call runs
+against BSE's public endpoints, so this is a real number, not an estimate.
 
-| Ticker | Transcripts found | Turns | Speakers | Mgmt words | Analyst words | Result |
-|---|---|---|---|---|---|---|
-| INFY | 5 | 171 | 27 | 13,122 | 3,831 | ✅ |
-| TCS | 5 | 81 | 15 | 5,104 | 1,564 | ✅ |
-| HDFCBANK | 1 | 99 | 13 | 4,273 | 1,424 | ✅ |
-| ASIANPAINT | 5 | 57 | 10 | 6,807 | 882 | ✅ |
-| DMART | 2 | 241 | 25 | 12,248 | 6,326 | ✅ |
-| SUNPHARMA | 7 | 59 | 5 | 8,274 | 0 | ⚠️ roles |
-| RELIANCE | 4 | — | — | — | — | ❌ no attribution |
-| TATAMOTORS | — | — | — | — | — | ❌ ticker lookup |
+| Outcome | Count | Meaning |
+|---|---|---|
+| **ok** | **61** | two or more transcripts, parsed, roles separated — diffable today |
+| `no_speaker_attribution` | 15 | filing is continuous prose; refused by design |
+| `roles_not_separated` | 12 | parses, but management and analysts land together |
+| `no_transcript_filed` | 8 | no earnings-call transcript on BSE in the window |
+| `only_one_transcript` | 4 | parses fine, nothing yet to diff against |
 
-**6 of 8 fully working. Both failures are understood, not mysterious.**
+**61/100 diffable.** Started at 53/100; the gain came from four fixes, below.
+
+### What moved the number
+
+| Fix | Effect |
+|---|---|
+| Exact ticker matching | `MARUTI` resolved to **MARUTI GLOBAL INDUSTRIES**, not Maruti Suzuki — silently the wrong company. Now refuses rather than guesses |
+| Banks file under "Analyst / Investor Meet" | SBI, Axis, Bajaj Finance file the quarterly call under that BSE category, not "Earnings Call Transcript". `no_transcript_filed` fell 18 → 8 |
+| Fourth transcript format | `Name - Affiliation` turn markers (Bharti Airtel and others) |
+| Analysts speak once | Requiring two appearances dropped every analyst, so all remaining speakers looked like management. Moderator introductions now rescue them |
 
 ---
 

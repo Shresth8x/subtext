@@ -1,269 +1,184 @@
-# Subtext — Cursor Agent Prompt
+# Subtext — Agent Context
 
-> This file is meant to be pasted into Cursor's AI agent / Composer as the system-level context prompt.
-> Update paths and URLs before use.
-
----
-
-## PASTE THIS INTO CURSOR AS YOUR PROJECT CONTEXT
+> Paste this into Cursor, Windsurf, Copilot, Gemini, or any coding assistant as
+> project context before asking it to change anything.
+>
+> **Last verified against the code: September 2026.**
 
 ---
 
-You are an expert full-stack engineer building **Subtext** — an AI-powered equity research SaaS platform for Indian retail investors. You have complete context via the sibling planning documents listed below.
+## What this is
+
+Subtext is a **disclosure intelligence engine for Indian equities**. It reads
+filings that listed companies are legally required to publish, tracks how their
+language changes quarter over quarter, and reports what changed — with the
+source sentence attached.
+
+**It is not an "AI stock report generator".** That framing was abandoned as
+undifferentiated. Read `docs/product-definition.md` before proposing features —
+`prd.md` and `vision.md` still describe the old product and are stale.
+
+Tagline: *"We don't tell you what to buy. We tell you what changed."*
 
 ---
 
-## Sibling Documentation (Read These First)
+## Current state: v0, Engine A only
 
-Before writing any code, read the relevant doc(s) for your task:
+Working end to end:
 
-| File | Purpose |
+```
+BSE announcement API
+   -> transcript PDF (following cover-letter links where needed)
+   -> speaker-attributed turns (management / analyst / journalist)
+   -> structured claims per topic          [needs an LLM key]
+   -> deterministic quarter-over-quarter diff
+   -> terminal or Telegram output
+```
+
+```bash
+python -m subtext transcripts INFY   # list earnings-call transcripts on BSE
+python -m subtext parse INFY         # speaker attribution        [no key needed]
+python -m subtext extract INFY       # structured claims          [needs key]
+python -m subtext diff INFY          # the actual product         [needs key]
+python -m subtext batch --universe 100   # coverage report        [no key needed]
+python -m subtext providers          # which LLM backend is configured
+python -m subtext telegram           # check bot token, find chat id
+python -m pytest tests/ -v           # 16 tests, no network
+```
+
+---
+
+## Module map
+
+| File | Responsibility |
 |---|---|
-| `docs/prd.md` | Product requirements, features, user personas, non-negotiables |
-| `docs/trd.md` | Full technical stack, architecture diagram, all API endpoints, caching strategy, security |
-| `docs/ux-design.md` | Color palette (exact CSS vars), typography, component styles, motion rules, screen layouts |
-| `docs/app-flow.md` | All screen IDs, user flows, state transitions, Telegram bot flows, error states |
-| `docs/backend-schema.md` | All PostgreSQL tables (with exact DDL), auth model, SSE pattern, env vars, file storage |
-| `docs/implementation-plan.md` | 4-phase build order, task checklist, test commands for each phase |
-| `docs/research.md` | Competitor analysis, how RAG/SSE/Celery/R2 work, Indian market specifics |
+| `subtext/bse.py` | BSE API: ticker resolution, filing search, PDF download, disk cache |
+| `subtext/transcript.py` | PDF -> speaker-attributed turns. The hardest code in the repo |
+| `subtext/claims.py` | Transcript -> structured claims (Pydantic models + prompt) |
+| `subtext/providers.py` | Pluggable LLM backends (Gemini/Groq/OpenRouter/GitHub/Anthropic) |
+| `subtext/diffengine.py` | Compares two quarters. **Pure Python, no LLM** |
+| `subtext/render.py` | Terminal output |
+| `subtext/telegram.py` | Bot API delivery, message chunking |
+| `subtext/batch.py` | Whole-index coverage runs |
+| `subtext/universe.py` | Nifty constituents from NSE's published CSVs |
+| `subtext/cli.py` | Argparse entry point |
 
 ---
 
-## Project Structure
+## Design decisions — do not undo these
 
-```
-subtext/
-├── subtext-web/          # Next.js 14 (App Router) + TypeScript + Tailwind
-├── subtext-backend/      # FastAPI (Python 3.11) + LangChain + Celery
-├── data/
-│   └── nifty500.csv        # NSE ticker universe (do not modify)
-├── config.yaml             # Screener thresholds (all configurable here)
-├── docs/                   # Planning docs (do not modify)
-└── .env.example            # Environment variable template
-```
+**1. Claims diff, not text diff.**
+Transcripts are reworded every quarter, so a textual diff is pure noise. Each
+quarter is normalised into a structured record (topic, stance, verbatim quote)
+and the *records* are compared. If you are tempted to `difflib` two transcripts,
+you have misunderstood the product.
 
----
+**2. Only management turns reach the model.**
+Analyst and journalist wording would contaminate the stance reading. This is why
+speaker attribution is the hard core of the parser rather than a nicety. Never
+pass a whole transcript to the LLM.
 
-## Architecture Rules (Non-Negotiable)
+**3. The diff engine contains no LLM.**
+The model normalises each quarter; arithmetic decides what changed. Same inputs
+always produce the same output, and the result is auditable. Keep
+`diffengine.py` free of API calls.
 
-### HARD CONSTRAINTS — Violating these is a critical failure:
+**4. Quotes are verified in code.**
+`claims.verify_quotes()` checks every cited sentence appears verbatim in the
+source. Unverified claims are **dropped from the diff**, not merely flagged. A
+promise of evidence is worth nothing if nothing checks it.
 
-1. **NO order placement** — Never write code that connects to a broker API (Zerodha Kite, Upstox, etc.)
-2. **NO capital deployment** — No code that moves money or places trades
-3. **NO fabricated data** — If a data field is None/null/missing, the output MUST say "no data". Never invent a number, percentage, or headline
-4. **Mandatory disclaimer** — Every AI-generated report and every Telegram alert MUST contain: `"Research Only — Not Investment Advice"`
-5. **Mandatory bear counter-point** — Every research report MUST include the `⚠️ BEAR COUNTER-POINT` section. It cannot be skipped or made optional
-6. **No hardcoded secrets** — All API keys, tokens, and passwords come from environment variables only. Never hardcode in source code
-7. **All screener thresholds in config.yaml** — Nothing hardcoded in screener logic
+**5. Refuse rather than emit something unsound.**
+If a filing has no speaker attribution, the CLI declines and says why. If a
+ticker is ambiguous, `resolve_ticker` raises instead of guessing. Silently
+analysing the wrong company is worse than failing.
 
----
+**6. No Buy/Hold/Avoid verdict, no conviction score.**
+Publishing a public research recommendation engages SEBI's Research Analyst
+regulations. Output evidence, changes and flags; let the user form the view.
+See `product-definition.md` §5.
 
-## Tech Stack (Do Not Deviate Without Asking)
-
-### Frontend
-- **Framework**: Next.js 14 with App Router (not Pages Router)
-- **Language**: TypeScript (strict mode)
-- **Styling**: Tailwind CSS (with custom CSS vars defined in `globals.css` per `ux-design.md`)
-- **Components**: shadcn/ui (do not introduce other component libraries)
-- **State**: Zustand (do not use Redux or Context for global state)
-- **Charts**: TradingView Lightweight Charts (for stock price charts only)
-- **Forms**: React Hook Form + Zod validation
-- **Auth client**: `@supabase/supabase-js`
-
-### Backend
-- **Framework**: FastAPI (Python 3.11+)
-- **AI orchestration**: LangChain + LangGraph
-- **LLM**: OpenAI GPT-4o (`gpt-4o`) as primary. Never use gpt-3.5 or older models.
-- **Embeddings**: OpenAI `text-embedding-3-small`
-- **PDF processing**: PyMuPDF + LlamaIndex
-- **Financial data**: `yfinance` (NSE tickers with `.NS` suffix)
-- **Technical analysis**: `pandas-ta`
-- **Task queue**: Celery with Redis as broker
-- **ORM**: SQLAlchemy (async)
-- **Validation**: Pydantic v2
-
-### Infrastructure
-- **Database**: Supabase (PostgreSQL + pgvector + Auth)
-- **Cache**: Upstash Redis
-- **File storage**: Cloudflare R2 (boto3-compatible, use presigned URLs for uploads)
-- **CDN**: Cloudflare
-- **Frontend deploy**: Vercel
-- **Backend deploy**: Railway (Dockerfile)
+**7. Everything is cached on disk** (`data/cache/`, gitignored). Be polite to
+BSE: keep the delay between requests, never parallelise the scraper hard.
 
 ---
 
-## Design Rules (Must Follow)
+## Transcript formats seen in the wild
 
-All design decisions follow `docs/ux-design.md`. Key rules:
+Three so far. The parser branches on them. If coverage work is your task, this
+is where it happens.
 
-1. **Color palette**: Use only the CSS variables defined in `ux-design.md`. The primary background is `--color-navy-950: #0a0f1e`. Accent is `--color-gold-400: #d4a853`. Never use plain blue, green, or red as brand colors.
-2. **Fonts**: Inter for body text, JetBrains Mono for all tickers, prices, and numeric data
-3. **Verdict badges**: `BUY` = `--color-buy` (green), `HOLD` = `--color-hold` (amber), `AVOID` = `--color-avoid` (red)
-4. **Animations**: Max 300ms duration. No infinite animations except the screener pulse dot.
-5. **Streaming**: Never show a loading spinner for AI report generation. Use SSE streaming so text appears word by word.
-6. **Empty states**: Every empty list/page must have a helpful message + CTA (see `ux-design.md §6`)
-7. **Mobile**: All layouts must work at 375px width. Sidebar collapses to bottom tab bar on mobile.
-8. **Accessibility**: All icons need `aria-label`. Color is never the sole indicator. WCAG AA contrast.
+| Format | Example | Speaker marker | Status |
+|---|---|---|---|
+| Participants block | INFY, DMART | Name on its own line; roles from a `CORPORATE PARTICIPANTS:` header | works |
+| Colon-delimited | TCS, HDFCBANK | `Name:` line; roles inferred from moderator's "from the line of X" hand-offs | works |
+| Unattributed prose | RELIANCE | none — names appear only inside sentences | refused by design |
 
----
+Companies also sometimes file a **cover letter linking to the transcript on
+their own website** (the Adani group does this). `bse.fetch_transcript_pdf()`
+detects that and follows the link via the PDF's link annotations.
 
-## API Conventions
-
-### Authentication
-Every FastAPI endpoint (except `/health`) requires:
-```
-Authorization: Bearer <supabase_jwt>
-```
-Use the `get_current_user` dependency that validates the JWT via Supabase.
-
-### Response format (success)
-```json
-{
-  "data": { ... },
-  "meta": { "timestamp": "2026-09-14T06:45:00Z" }
-}
-```
-
-### Response format (error)
-```json
-{
-  "error": {
-    "code": "RATE_LIMIT_EXCEEDED",
-    "message": "You've used all 5 reports this month."
-  }
-}
-```
-
-### SSE stream events
-```json
-{"type": "chunk", "text": "...streamed text..."}
-{"type": "progress", "step": "fetching_data", "message": "Fetching live market data..."}
-{"type": "done", "report_id": "uuid"}
-{"type": "error", "message": "...error message..."}
-```
+Banks and NBFCs file the quarterly earnings call under the BSE category
+**"Analyst / Investor Meet - Outcome"**, not "Earnings Call Transcript" — SBI,
+Axis and Bajaj Finance all do. The filters in `bse.py` account for this.
 
 ---
 
-## Database Conventions
+## Bugs already found and fixed — do not reintroduce
 
-- All tables use `UUID` primary keys (not integer sequences)
-- All tables have `created_at TIMESTAMPTZ DEFAULT NOW()`
-- **All tables have Row Level Security (RLS) enabled** — never forget this
-- Foreign keys always use `ON DELETE CASCADE`
-- Use `snake_case` for all column names
-- Never expose `SUPABASE_SERVICE_ROLE_KEY` to the client side
+Each of these was silent and produced plausible but wrong output:
 
----
-
-## Cache Key Convention
-
-```
-subtext:{resource}:{identifier}:{date}
-
-Examples:
-subtext:fundamentals:RELIANCE:2026-09-14
-subtext:technicals:INFY:2026-09-14
-subtext:shareholding:TATAPOWER:2026-09-14
-subtext:ratelimit:user_id:reports
-```
-
----
-
-## Testing Requirements
-
-Every new service/function must have a corresponding test:
-
-### Backend (pytest)
-```bash
-# Run all backend tests
-cd subtext-backend && python -m pytest tests/ -v
-
-# Run specific suite
-python -m pytest tests/test_data_fetcher.py -v
-```
-
-Key test rules:
-- Mock `yfinance` calls in tests (never hit real API in CI)
-- Test that missing data → returns `None` or `"no data"` string, never a fabricated value
-- Test that every report output contains the word "Research Only"
-- Test that bear_counterpoint is always non-empty in report output
-
-### Frontend (Playwright)
-```bash
-cd subtext-web && npx playwright test
-```
-
-Key test rules:
-- Test auth flow (signup, login, redirect)
-- Test that "Generate Report" button fires the API call
-- Test that streaming text appears in the DOM
-- Test that bear counter-point card is always rendered
+1. **A page-furniture filter that deleted the CEO.** Dropping lines that repeat
+   on >50% of pages seems sensible until you realise the busiest speaker's name
+   is a standalone line on most pages. Only the top/bottom two lines per page
+   are eligible now.
+2. **`re.I` on the analyst-intro regex defeated `[A-Z]`**, so the capture ran
+   past the name into "... from `<firm>`". No analyst ever matched and every
+   analyst was labelled management. The flag is scoped `(?i:...)` now.
+3. **Exclusion rules matched free text.** `HEADLINE` and `MORE` are long blurbs,
+   not subject lines. Reliance mentions its analyst meet in passing and all four
+   of its transcripts were discarded. Exclusions test `NEWSSUB` only.
+4. **Only half of Infosys parsed.** One filing often holds two transcripts
+   (press conference, then earnings call), each with its own participants block.
+   Scanning only the first 400 lines missed the entire earnings call.
+5. **Ligatures broke quote verification.** PDF text carries `speciﬁc` as one
+   glyph. `_LIGATURES` normalises them.
+6. **BSE serves older attachments from `AttachHis`, not `AttachLive`.**
+7. **Fuzzy ticker search returned the wrong company.** `MARUTI` resolved to
+   MARUTI GLOBAL INDUSTRIES, not Maruti Suzuki. Exact ticker match is required.
 
 ---
 
-## Forbidden Patterns
+## Conventions
 
-❌ **Do not use** `pages/` directory — use App Router (`app/`) only
-❌ **Do not use** `useEffect` for data fetching — use React Server Components or SWR/TanStack Query
-❌ **Do not use** `any` TypeScript type — always define proper types in `types/index.ts`
-❌ **Do not use** inline styles — use Tailwind classes or CSS vars only
-❌ **Do not use** `console.log` in production code — use the structured logger
-❌ **Do not** `import openai` directly in route handlers — all AI calls go through `services/ai_analyst.py`
-❌ **Do not** store PDF content in PostgreSQL — PDFs go to Cloudflare R2, only file IDs in DB
-❌ **Do not** run screener in a synchronous request handler — always use Celery task
-❌ **Do not** expose the Supabase service role key in any Next.js client component
+- Python 3.11+, standard library plus `requests`, `pymupdf`, `pydantic`
+- No secrets in code. Everything via `.env` / `config.py`
+- New LLM backends go in `providers.py`, never inline in `claims.py`
+- Windows is a first-class target: force UTF-8 on stdout, use `pathlib`
+- Tests must run without network or an API key
 
 ---
 
-## Available Tools & MCPs You Can Use in Cursor
+## What to build next, in order
 
-When building Subtext in Cursor, the following tools are available to you:
-
-### MCP Servers (if configured)
-- **Supabase MCP**: Query and manage the Supabase database directly from Cursor. Use for running migrations, checking table schemas, validating RLS policies.
-- **Cloudflare MCP**: Manage R2 buckets and Workers from Cursor if available.
-- **GitHub MCP**: Create PRs, manage branches, check CI status.
-
-### Browser / DevTools
-- Use Cursor's built-in terminal to run `pytest`, `npm run dev`, `npx playwright test`
-- Preview the running app at `http://localhost:3000` (Next.js) and `http://localhost:8000/docs` (FastAPI auto-generated Swagger UI)
-- Use FastAPI's `/docs` endpoint (Swagger UI) to test API endpoints manually during development
-
-### Useful CLI Commands to Remember
-```bash
-# Start development
-cd subtext-web && npm run dev          # Frontend at :3000
-cd subtext-backend && uvicorn main:app --reload --port 8000  # Backend at :8000
-celery -A tasks.celery_app worker --loglevel=info  # Celery worker
-celery -A tasks.celery_app beat --loglevel=info    # Celery scheduler
-
-# Run tests
-cd subtext-backend && python -m pytest tests/ -v --tb=short
-cd subtext-web && npx playwright test
-
-# Database migrations (Supabase)
-# Migrations are SQL files in supabase/migrations/ — run via Supabase dashboard or CLI
-
-# Deploy
-vercel --prod                           # Frontend
-railway up                              # Backend (from subtext-backend/)
-```
+1. **Prove the model path.** `extract` and `diff` have never made a real API
+   call. Get a free key at aistudio.google.com/apikey, set `GEMINI_API_KEY` in
+   `.env`, then run `python -m subtext diff INFY`. This is the top priority.
+2. **Close the coverage gaps.** Run `python -m subtext batch --universe 100` and
+   read `data/coverage_*.json`. The `roles_not_separated` bucket is the biggest
+   remaining cluster — those parse fine but management and analysts land
+   together, so stance readings cannot be trusted.
+3. **Telegram scheduling** — a daily job that diffs watchlist tickers when a new
+   transcript appears.
+4. **Engine B**: the announcement firehose -> morning dispatch + governance
+   tripwires (pledge changes, auditor resignations, rating actions). See
+   `product-definition.md` §7.
 
 ---
 
-## Current Phase
+## When in doubt
 
-> **Start with Phase 1** (per `implementation-plan.md`):
-> Build the Python screener + Telegram alert pipeline first.
-> Verify it works end-to-end before touching the web app.
-> Command: `python main.py --phase 1` must send a Telegram message.
-
----
-
-## When In Doubt
-
-1. Check `docs/prd.md` for what the feature should do
-2. Check `docs/trd.md` for how it should be built
-3. Check `docs/ux-design.md` for how it should look
-4. Check `docs/backend-schema.md` for the exact DB schema
-5. Ask before deviating from the stack or architecture — don't introduce new libraries without justification
+1. `docs/product-definition.md` — what we're building and why
+2. `docs/prototype-status.md` — measured coverage and known gaps
+3. `docs/trd.md` — stack and architecture (still broadly current)
+4. Do not add dependencies without a reason. This runs on a student laptop.

@@ -210,10 +210,57 @@ _INTRO = re.compile(
     r"\s+(?i:mr\.?\s+|ms\.?\s+|mrs\.?\s+|dr\.?\s+)?"
     r"([A-Z][A-Za-z'.\-]+(?:\s+[A-Z][A-Za-z'.\-]+){0,3})")
 
+def _introduced_names(lines: list[str]) -> set[str]:
+    """Names the moderator hands the floor to — i.e. the analysts.
+
+    Scans the joined text, not line by line: PDF extraction wraps sentences, so
+    an introduction can straddle a line break and a per-line scan misses it.
+
+    The capture is truncated at the first period. Transcripts usually read
+    "...comes from Mr. Aditya Bansal. Mr. Bansal, you may ask your question",
+    and without truncating, the name runs across the sentence boundary and
+    becomes "Aditya Bansal. Mr. Bansal", which matches no speaker line.
+    """
+    blob = " ".join(l.strip() for l in lines)
+    out = set()
+    for m in _INTRO.finditer(blob):
+        name = m.group(1).split(".")[0].strip().rstrip(",")
+        if name and not _JUNK_NAME.match(name):
+            out.add(name)
+    return out
+
+
 # Lines that pass the name shape but are obviously not people.
 _JUNK_NAME = re.compile(
     r"^(date|time|venue|subject|place|ref|sub|note|page|thank you|"
     r"agenda|annexure|regards|sincerely)$", re.I)
+
+
+# A fourth layout (Bharti Airtel and others): the turn marker is the speaker's
+# name and affiliation on one line, with no colon —
+#     Vivekanand Subbaraman - Ambit Capital
+# The dash must be surrounded by spaces so hyphenated surnames don't split.
+_DASH_SPEAKER = re.compile(
+    r"^\s*((?:[A-Z][A-Za-z'.]+\s+){0,3}[A-Z][A-Za-z'.]+)\s+[-–—]\s+([A-Za-z][^|]{2,60}?)\s*$")
+
+
+def _dash_speakers(lines: list[str]) -> dict[str, str]:
+    """Speaker map for `Name - Affiliation` transcripts."""
+    hits = Counter()
+    for ln in lines:
+        m = _DASH_SPEAKER.match(ln)
+        if m and not _JUNK_NAME.match(m.group(1).strip()):
+            hits[m.group(1).strip()] += 1
+
+    introduced = _introduced_names(lines)
+
+    roles: dict[str, str] = {}
+    for name, count in hits.items():
+        if _MODERATOR_NAME.match(name):
+            roles[name] = MODERATOR
+        elif count >= 2:
+            roles[name] = ANALYST if name in introduced else MANAGEMENT
+    return roles
 
 
 def _colon_speakers(lines: list[str]) -> dict[str, str]:
@@ -232,8 +279,7 @@ def _colon_speakers(lines: list[str]) -> dict[str, str]:
     # Scan the joined text, not line by line: PDF extraction wraps sentences, so
     # an introduction can straddle a line break ("...from the line of Sandeep\nShah
     # from Equirus") and a per-line scan silently misses that analyst.
-    blob = " ".join(l.strip() for l in lines)
-    introduced = {m.group(1).strip() for m in _INTRO.finditer(blob)}
+    introduced = _introduced_names(lines)
 
     roles: dict[str, str] = {}
     for name, count in hits.items():
@@ -241,23 +287,29 @@ def _colon_speakers(lines: list[str]) -> dict[str, str]:
             continue
         if _MODERATOR_NAME.match(name):
             roles[name] = MODERATOR
+        elif name in introduced:
+            # An analyst typically asks once and leaves. Requiring two
+            # appearances drops them all, and then every remaining speaker looks
+            # like management — which is exactly the contamination to avoid.
+            roles[name] = ANALYST
         elif count >= 2:
-            roles[name] = ANALYST if name in introduced else MANAGEMENT
+            roles[name] = MANAGEMENT
     return roles
 
 
 def parse(pdf: Path) -> Transcript:
     lines = _strip_page_furniture(_read_pages(pdf))
 
-    # Two layouts in the wild: a participants block up top (Infosys style), or
-    # bare `Name:` turn markers with no block at all (TCS style). Try the block
-    # first, fall back when it yields nothing usable.
+    # Three layouts in the wild: a participants block up top (Infosys style),
+    # bare `Name:` turn markers (TCS style), or `Name - Affiliation` lines
+    # (Bharti Airtel style). Try the block first, then fall back to whichever
+    # marker style yields the most speakers.
     cands, block_idx = _candidate_names(lines)
     roles = _validate(cands, lines, block_idx)
     if not any(r == MANAGEMENT for r in roles.values()) or len(roles) < 2:
-        colon = _colon_speakers(lines)
-        if len(colon) > len(roles):
-            roles = colon
+        for fallback in (_colon_speakers(lines), _dash_speakers(lines)):
+            if len(fallback) > len(roles):
+                roles = fallback
 
     turns: list[Turn] = []
     speaker, buf = None, []
@@ -278,6 +330,11 @@ def parse(pdf: Path) -> Transcript:
         if m and m.group(1).strip() in roles:
             flush()
             speaker, buf = m.group(1).strip(), [m.group(2)]
+            continue
+        m = _DASH_SPEAKER.match(ln)
+        if m and m.group(1).strip() in roles:
+            flush()
+            speaker, buf = m.group(1).strip(), []
             continue
         if speaker:
             buf.append(ln)

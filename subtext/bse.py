@@ -25,10 +25,22 @@ ATTACH_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
 # call. AGM / investor-day / analyst-meet transcripts are filed the same way and
 # must be excluded or the quarter-on-quarter comparison is meaningless.
 _TRANSCRIPT = re.compile(r"transcript", re.I)
-_EARNINGS = re.compile(r"earnings?\s*call|earning\s*call|con\s*call|conference\s*call|q[1-4]\s*fy", re.I)
+
+# Banks and NBFCs file their quarterly earnings call under the BSE category
+# "Analyst / Investor Meet - Outcome" rather than "Earnings Call Transcript" —
+# SBI, Axis and Bajaj Finance all do. Treating an analyst/investor *meet* as a
+# non-earnings event drops those companies entirely, so it counts here.
+_EARNINGS = re.compile(
+    r"earnings?\s*call|earning\s*call|con\s*call|conference\s*call|q[1-4]\s*fy"
+    r"|analyst\s*/?\s*investor\s*meet|analyst\s*meet|investor\s*meet"
+    r"|quarter|financial results", re.I)
+
+# Only genuinely non-quarterly events. A multi-day strategy event or an AGM is
+# not comparable quarter-on-quarter; a routine analyst meet is.
 _EXCLUDE = re.compile(
-    r"annual general meeting|\bagm\b|investor day|analyst meet|"
-    r"investor meet|ai day|capital markets day|extra[- ]?ordinary general",
+    r"annual general meeting|\bagm\b|\begm\b|extra[- ]?ordinary general|"
+    r"investor day|analyst day|capital markets day|\bai day\b|"
+    r"investor conference|analyst conference|business responsibility",
     re.I,
 )
 
@@ -77,16 +89,45 @@ def _get(url: str, params: dict | None = None, *, binary: bool = False):
     return r.json()
 
 
+_RESULT = re.compile(r"liclick\('(\d+)','([^']*)'\).*?<span>(.*?)</span>", re.S)
+
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>|&nbsp;", " ", s)).strip()
+
+
 def resolve_ticker(ticker: str) -> Scrip:
-    """NSE-style ticker -> BSE scrip code, via BSE's own search endpoint."""
-    raw = _get(SEARCH_URL, {"Type": "SS", "text": ticker})
+    """NSE-style ticker -> BSE scrip code, via BSE's own search endpoint.
+
+    BSE's search is fuzzy and ranks by relevance, not exactness: searching
+    "MARUTI" returns MARUTI GLOBAL INDUSTRIES above Maruti Suzuki. Taking the
+    first result therefore analyses the wrong company *silently*, which is far
+    worse than failing. So every result is parsed and only an exact ticker match
+    is accepted — ambiguity raises rather than guesses.
+    """
+    want = ticker.strip().upper()
+    raw = _get(SEARCH_URL, {"Type": "SS", "text": want})
     html = raw if isinstance(raw, str) else str(raw)
-    m = re.search(r"liclick\('(\d+)','([^']+)'\)", html)
-    if not m:
-        raise LookupError(f"BSE has no scrip matching {ticker!r}")
-    isin = re.search(r"(INE[0-9A-Z]{9})", html)
-    return Scrip(code=m.group(1), name=m.group(2).strip(),
-                 isin=isin.group(1) if isin else "", ticker=ticker.upper())
+
+    candidates: list[Scrip] = []
+    for code, name, span in _RESULT.findall(html):
+        parts = _strip_tags(span).split()
+        if not parts:
+            continue
+        candidates.append(Scrip(
+            code=code, name=name.strip(), ticker=parts[0].upper(),
+            isin=next((p for p in parts if p.startswith("INE")), "")))
+
+    if not candidates:
+        raise LookupError(f"BSE search returned nothing for {ticker!r}")
+
+    exact = [c for c in candidates if c.ticker == want]
+    if not exact:
+        near = ", ".join(f"{c.ticker} ({c.name[:22]})" for c in candidates[:4])
+        raise LookupError(
+            f"No BSE scrip has the exact ticker {want!r}. Closest: {near}. "
+            f"Refusing to guess — the wrong company would be analysed silently.")
+    return exact[0]
 
 
 def announcements(scrip_code: str, *, months_back: int = 18) -> list[dict]:
