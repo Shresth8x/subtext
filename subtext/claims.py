@@ -17,7 +17,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from . import config
+from . import config, providers
 from .transcript import Transcript
 
 
@@ -89,36 +89,19 @@ def extract(transcript: Transcript, *, ticker: str, period_hint: str = "",
     if not body.strip():
         raise ValueError("No management turns found — cannot extract claims.")
 
-    cache = config.CACHE_DIR / "claims" / f"{ticker}_{_fingerprint(body + config.MODEL)}.json"
+    p = providers.detect()
+    model = providers.model_for(p)
+    cache = config.CACHE_DIR / "claims" / f"{ticker}_{_fingerprint(body + model)}.json"
     if cache.exists() and not refresh:
         return QuarterExtract.model_validate_json(cache.read_text("utf-8"))
 
-    import anthropic
-
-    # An unset ANTHROPIC_API_KEY does not mean there are no credentials: the SDK
-    # also resolves an OAuth profile written by `ant auth login`. Construct with
-    # no arguments in that case and let the SDK do its own lookup.
-    try:
-        client = (anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-                  if config.ANTHROPIC_API_KEY else anthropic.Anthropic())
-    except Exception as e:
-        raise RuntimeError(
-            f"No Anthropic credentials found ({e}). Either add ANTHROPIC_API_KEY "
-            f"to .env, or run `ant auth login`."
-        ) from e
     prompt = (
         f"Company: {ticker}\n"
         f"Period (from the filing, may be approximate): {period_hint or 'unknown'}\n\n"
         f"Management remarks from the earnings call:\n\n{body}"
     )
-    response = client.messages.parse(
-        model=config.MODEL,
-        max_tokens=16000,
-        system=SYSTEM,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=QuarterExtract,
-    )
-    result: QuarterExtract = response.parsed_output
+    payload = providers.complete_json(SYSTEM, prompt, QuarterExtract)
+    result = QuarterExtract.model_validate(payload)
 
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(result.model_dump_json(indent=2), "utf-8")

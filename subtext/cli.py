@@ -14,7 +14,7 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-from . import batch as batch_mod, bse, claims as claims_mod, render, universe  # noqa: E402
+from . import batch as batch_mod, bse, claims as claims_mod, providers, render, universe  # noqa: E402
 from .diffengine import compare  # noqa: E402
 from .transcript import ANALYST, JOURNALIST, MANAGEMENT, parse as parse_pdf  # noqa: E402
 
@@ -176,6 +176,33 @@ def cmd_telegram(args) -> int:
     return 0
 
 
+def cmd_providers(args) -> int:
+    print("\n  LLM providers (first one with a key set is used):\n")
+    active = None
+    try:
+        active = providers.detect()
+    except providers.ProviderError:
+        pass
+    for p in providers.PROVIDERS:
+        mark = "->" if active and p.name == active.name else "  "
+        state = "key set" if p.key else "not set"
+        print(f"  {mark} {p.name:<12} {p.env_key:<22} {state:<9} {p.note}")
+    if not active:
+        print("\n  None configured. Put one key in .env - see the list above.")
+        return 1
+    print(f"\n  active: {active.name}  model: {providers.model_for(active)}")
+    if args.models:
+        try:
+            names = providers.available_models(active)
+        except providers.ProviderError as e:
+            print(f"\n  could not list models: {e}")
+            return 1
+        print(f"\n  {len(names)} model(s) this key can use:")
+        for n in names[:40]:
+            print(f"    {n}")
+    return 0
+
+
 def cmd_batch(args) -> int:
     tickers = universe.nifty(args.universe)
     if args.limit:
@@ -218,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
                             help="Also deliver the diff to Telegram.")
             sp.add_argument("--chat-id", default="",
                             help="Telegram chat id (else TELEGRAM_CHAT_ID).")
+
+    pp = sub.add_parser("providers", help="Show which LLM provider is configured")
+    pp.add_argument("--models", action="store_true", help="Also list usable models.")
+    pp.set_defaults(func=cmd_providers)
 
     tp = sub.add_parser("telegram", help="Check the bot token / find your chat id")
     tp.set_defaults(func=cmd_telegram)
