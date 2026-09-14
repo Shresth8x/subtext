@@ -1,0 +1,22 @@
+# secrets
+.env
+.env.local
+
+# cache and generated data
+data/cache/
+data/
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
